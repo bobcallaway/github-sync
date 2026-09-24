@@ -5,7 +5,8 @@ description: |
 inputs:
   work_dir:
     required: false
-    description: 'Where the Pulumi config are located.'
+    description: 'Where the Pulumi config are located, relative to the workspace.'
+    default: '.'
   config_directory:
     required: false
     description: 'Where the Github config are located.'
@@ -26,6 +27,10 @@ inputs:
   gh_token:
     required: true
     description: 'GitHub Token with pull_request scope to be able to post comments in the PR'
+  project_name:
+    required: false
+    description: 'Pulumi project name. Must match the project the stack belongs to.'
+    default: 'sigstore-github-sync'
 
 runs:
   using: "composite"
@@ -37,13 +42,91 @@ runs:
         check-latest: true
         cache: false
 
-    - name: Copy config to run pulumi
+    # Pulumi.<stack>.yaml is not inert: provider settings such as
+    # github:baseUrl decide where the decrypted github:token is sent, and an
+    # `environment:` block can import other Pulumi ESC environments. On pull
+    # request events the caller's checkout may be attacker-controlled, so the
+    # stack config is taken from a separate checkout of the PR's base commit.
+    # The PR checkout could contain .github-sync-base as a symlink, which would
+    # redirect the checkout below (its path check is lexical). Remove it first.
+    - name: Clear base checkout path
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      run: rm -rf "${GITHUB_WORKSPACE}/.github-sync-base"
+      shell: bash
+
+    - name: Checkout base commit for stack config
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+        path: .github-sync-base
+        persist-credentials: false
+        fetch-depth: 1
+
+    # Pulumi.yaml determines which program Pulumi runs, so it is generated here
+    # rather than taken from the caller.
+    - name: Stage pulumi project
       env:
         CONFIG_DIRECTORY: ${{ inputs.config_directory }}
         WORK_DIR: ${{ inputs.work_dir }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+        IS_PR: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
       run: |
-        cp -r ${CONFIG_DIRECTORY} $GITHUB_ACTION_PATH
-        cp ${WORK_DIR}/Pulumi*.yaml $GITHUB_ACTION_PATH
+        set -euo pipefail
+        shopt -s nullglob
+
+        if [[ ! "${PROJECT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+          echo "::error::invalid project_name: ${PROJECT_NAME}"
+          exit 1
+        fi
+
+        # The config directory's contents come from the PR, so they must not
+        # merge into the program sources or point at files outside the checkout.
+        config_dest="${GITHUB_ACTION_PATH}/$(basename "${CONFIG_DIRECTORY%/}")"
+        if [[ -e "${config_dest}" || -L "${config_dest}" ]]; then
+          echo "::error::config_directory '${CONFIG_DIRECTORY}' would overwrite ${config_dest}"; exit 1
+        fi
+        if [[ -n "$(find "${CONFIG_DIRECTORY}" -type l -print -quit)" ]]; then
+          echo "::error::config_directory '${CONFIG_DIRECTORY}' must not contain symlinks"; exit 1
+        fi
+        cp -r "${CONFIG_DIRECTORY}" "${GITHUB_ACTION_PATH}"
+
+        if [[ "${IS_PR}" == "true" ]]; then
+          root="$(realpath -e -- "${GITHUB_WORKSPACE}/.github-sync-base")"
+        else
+          root="$(realpath -e -- "${GITHUB_WORKSPACE}")"
+        fi
+        # work_dir is always resolved relative to the workspace root.
+        stack_dir="$(realpath -e -- "${root}/${WORK_DIR#"${GITHUB_WORKSPACE}"}")" || {
+          echo "::error::work_dir '${WORK_DIR}' not found"; exit 1; }
+        if [[ "${stack_dir}" != "${root}" && "${stack_dir}" != "${root}/"* ]]; then
+          echo "::error::work_dir '${WORK_DIR}' resolves outside ${root}"; exit 1
+        fi
+
+        stack_configs=( "${stack_dir}"/Pulumi.*.yaml )
+        if (( ! ${#stack_configs[@]} )); then
+          echo "::error::no Pulumi.<stack>.yaml found in ${stack_dir}"
+          exit 1
+        fi
+
+        for f in "${stack_configs[@]}"; do
+          # Refuse symlinks so a base-branch file can't pull in content from elsewhere.
+          if [[ -L "${f}" ]]; then
+            echo "::error::${f} is a symlink"
+            exit 1
+          fi
+          cp "${f}" "${GITHUB_ACTION_PATH}"
+          name=$(basename "${f}")
+          if [[ "${IS_PR}" == "true" && -f "${WORK_DIR}/${name}" ]] && ! cmp -s "${WORK_DIR}/${name}" "${f}"; then
+            echo "::notice::${name} is changed in this PR; the preview uses the base branch version. Stack config changes take effect only after merge."
+          fi
+        done
+
+        cat > "${GITHUB_ACTION_PATH}/Pulumi.yaml" <<EOF
+        name: ${PROJECT_NAME}
+        runtime: go
+        description: Sync GitHub users, collaborators and repositories for an organization
+        EOF
       shell: bash
 
     - name: Go mod download
